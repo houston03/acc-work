@@ -1,0 +1,242 @@
+from typing import TYPE_CHECKING
+
+import aioredis
+
+from app.clients.base_client import BaseClient, Singleton
+
+from typing import Any, Dict, List
+
+from aiohttp import web
+from redis.asyncio.cluster import ClusterNode, RedisCluster
+import redis.asyncio as redis # New
+
+
+
+if TYPE_CHECKING:
+    from aioredis.client import Redis
+
+
+
+class RedisClient(BaseClient, metaclass=Singleton):
+    client: "Redis" = None
+
+    async def start_client(self):
+        # Запуск клиента
+        self.client = await self.__init_redis__()
+
+    async def stop_client(self):
+        # Остановка клиента
+        if self.client:
+            await self.client.close()
+
+    async def __init_redis__(self):
+        # Создание пула подключений к редис
+        if self.config.redis.check:
+            redis = await aioredis.from_url(
+                f"redis://{self.config.redis.REDIS_HOST}:{self.config.redis.REDIS_PORT}",
+                password=self.config.redis.REDIS_PASSWORD,
+                max_connections=self.config.redis.REDIS_MAXSIZE,
+                db=self.config.redis.REDIS_DB,
+            )
+
+            return redis
+
+
+
+
+
+class RedisClusterClient:
+    def __init__(
+        self,
+        startup_nodes: List[Dict[str, Any]],
+        password: str,
+        key_prefix: str,
+        default_expire: int,
+    ):
+        self.startup_nodes = startup_nodes
+        self.default_expire = default_expire
+        self.key_prefix = f'{{db{key_prefix}}}:' if key_prefix else ''
+        self._client = RedisCluster(
+            startup_nodes=startup_nodes,
+            password=password,
+            read_from_replicas=True,
+            encoding='utf-8',
+        )
+
+
+    async def execute(self, command: str, *args: Any, ex: int = None) -> Any:
+        ttl = self.default_expire if ex is None else ex
+        if command == 'MGET':
+            return await self.mget(*args)
+        elif command == 'MSET':
+            return await self.mset(*args, ttl=ttl)
+        elif command == 'DEL':
+            return await self.delete(*args)
+        elif command == 'KEYS':
+            return await self.keys(*args)
+        elif command == 'HKEYS':
+            return await self.hkeys(*args)
+
+        if not args:
+            return await self._client.execute_command(command)
+
+        args_with_prefix = (self.add_prefix(args[0]), *args[1:])
+        result = await self._client.execute_command(command, *args_with_prefix)
+        if command in ["SET", "HSET", "HMSET"]:
+            await self.expire(args[0], ttl)
+        return result
+
+    async def delete(self, *keys: str) -> int:
+        prefixed_keys = [self.add_prefix(key) for key in keys]
+        return await self._client.delete(*prefixed_keys)
+
+    async def hset(self, name: str, field: str, value: Any) -> int:
+        return await self._client.hset(self.add_prefix(name), field, value)
+
+    async def hget(self, name: str, field: str) -> Any:
+        return await self._client.hget(self.add_prefix(name), field)
+
+    async def hmget(self, name: str, *fields: str) -> List[Any]:
+        return await self._client.hmget(self.add_prefix(name), *fields)
+
+    async def hmset(self, name: str, mapping: Dict[str, Any]) -> bool:
+        return await self._client.hset(self.add_prefix(name), mapping=mapping)
+
+    async def hgetall(self, name: str) -> Dict[str, Any]:
+        return await self._client.hgetall(self.add_prefix(name))
+
+    async def ttl(self, name: str) -> int:
+        return await self._client.ttl(self.add_prefix(name))
+
+    async def incr(self, name: str) -> int:
+        return await self._client.incr(self.add_prefix(name))
+
+    async def decr(self, name: str) -> int:
+        return await self._client.decr(self.add_prefix(name))
+
+    async def expire(self, name: str, expire: int) -> bool:
+        return await self._client.expire(self.add_prefix(name), expire)
+
+    async def mset(self, *args: Any, ttl: int) -> bool:
+        keys_values = zip(args[0::2], args[1::2])
+        prefixed_data = {self.add_prefix(key): value for key, value in keys_values}
+        result = await self._client.mset(prefixed_data)
+        for key in args[0::2]:
+            await self._client.expire(key, ttl)
+        return result
+
+    async def mget(self, *keys: str) -> List[Any]:
+        prefixed_keys = [self.add_prefix(key) for key in keys]
+        return await self._client.mget(*prefixed_keys)
+
+    async def getrange(self, name: str, start: int, end: int) -> str:
+        return await self._client.getrange(self.add_prefix(name), start, end)
+
+    async def exists(self, name: str) -> bool:
+        return await self._client.exists(self.add_prefix(name))
+
+    async def keys(self, name: str) -> List[str]:
+        return await self._client.execute_command(
+            'KEYS', self.add_prefix(name), target_nodes=self._client.get_nodes()
+        )
+
+    async def hkeys(self, name: str):
+        return await self._client.execute_command(
+            'HKEYS', self.add_prefix(name)
+        )
+
+    async def lock(self, name: str, timeout: int) -> bool:
+        return await self._client.lock(self.add_prefix(name), timeout)
+
+    async def flushdb(self) -> None:
+        return await self._client.flushdb()
+
+    async def flushall(self) -> None:
+        return await self._client.flushall()
+
+    def change_prefix(self, new_prefix: str):
+        self.key_prefix = new_prefix
+
+    def add_prefix(self, name: str) -> str:
+        return f'{self.key_prefix}{name}'
+
+    async def close(self):
+
+        if self._client:
+            await self._client.close()
+
+
+
+
+async def init_redis_cluster(app: web.Application) -> bool:
+    cluster_nodes = app["config"]["redis"].get('cluster_nodes')
+    """
+    if len(cluster_nodes) == 0:
+        return False
+    """
+    if not cluster_nodes:
+        return False
+
+    cluster_nodes = cluster_nodes.split(',')
+    cluster_hosts = [nodes.split(':')[0] for nodes in cluster_nodes]
+    cluster_ports = [nodes.split(':')[1] for nodes in cluster_nodes]
+    key_prefix = str(app["config"]["redis"].get('db', ''))
+    default_expire = app["config"]["redis"].get('default_expire')
+
+    startup_nodes = [
+        ClusterNode(host=host, port=int(port))
+        for host, port in zip(cluster_hosts, cluster_ports)
+    ]
+    password = app["config"]["redis"]["password"]
+    app["redis_cluster"] = RedisClusterClient(
+        startup_nodes, password, key_prefix, default_expire
+    )
+    return True
+
+async def close_redis_cluster(app: web.Application):
+    if "redis_cluster" in app:
+        await app["redis_cluster"].close()
+
+
+class RedisInitClient:
+    """Обертка для RedisClient и RedisClusterClient, обеспечивающая прозрачное переключение."""
+
+    def __init__(self, config):
+        self.config = config
+        self._client = None
+
+    async def start_client(self):
+        """Инициализация клиента Redis (Standalone или Cluster)."""
+        self._client = await self._get_redis_client()
+        print(f"✅ Используется {'Redis Cluster' if isinstance(self._client, RedisClusterClient) else 'Обычный Redis'}") # временная проверка переключения. будет убрана
+
+    async def _get_redis_client(self):
+        """Выбирает и создаёт подходящий клиент Redis."""
+        cluster_nodes = self.config.redis.REDIS_CLUSTER_NODES
+        if cluster_nodes:
+            startup_nodes = [
+                ClusterNode(host=node.split(':')[0], port=int(node.split(':')[1]))
+                for node in cluster_nodes.split(',')
+            ]
+            return RedisClusterClient(
+                startup_nodes=startup_nodes,
+                password=self.config.redis.REDIS_PASSWORD,
+                key_prefix=str(self.config.redis.REDIS_DB),
+                default_expire=self.config.redis.REDIS_DEFAULT_EXPIRE,
+            )
+        else:
+            client = RedisClient()
+            await client.start_client()
+            return client
+
+    async def stop_client(self):
+        """Закрытие Redis-клиента."""
+        if self._client:
+            await self._client.close()
+
+    def __getattr__(self, name):
+        """Перенаправляет вызовы методов в выбранный клиент."""
+        if not self._client:
+            raise RuntimeError("Redis-клиент не инициализирован!")
+        return getattr(self._client, name)
+
